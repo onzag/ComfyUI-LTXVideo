@@ -100,6 +100,13 @@ class LTXVBaseSampler:
                         "tooltip": "The blur value to use for preprocessing the images.",
                     },
                 ),
+                "optional_cond_strength": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "This allows specifying the strength of each image in the conditional using an index based approach of comma separated values, note this will override strength"
+                    },
+                ),
             },
         }
 
@@ -121,6 +128,7 @@ class LTXVBaseSampler:
         noise,
         optional_cond_images=None,
         optional_cond_indices=None,
+        optional_cond_strength=None,
         strength=0.9,
         crop="disabled",
         crf=35,
@@ -130,8 +138,10 @@ class LTXVBaseSampler:
         optional_negative_index_strength=1.0,
         optional_initialization_latents=None,
     ):
-
         if optional_cond_images is not None:
+            assert optional_cond_indices is not None and bool(optional_cond_indices.strip()), "You must specify optional_cond_indices if optional_cond_images specified"
+            assert optional_cond_strength is not None and bool(optional_cond_strength.strip()), "You must specify optional_cond_strength if optional_cond_images specified"
+
             optional_cond_images = (
                 comfy.utils.common_upscale(
                     optional_cond_images.movedim(-1, 1),
@@ -157,6 +167,17 @@ class LTXVBaseSampler:
             assert len(optional_cond_indices) == len(
                 optional_cond_images
             ), "Number of optional cond images must match number of optional cond indices"
+
+        if optional_cond_strength is not None and bool(optional_cond_strength.strip()) and optional_cond_images is not None:
+            optional_cond_strength = optional_cond_strength.split(",")
+            optional_cond_strength = [float(i) for i in optional_cond_strength]
+            assert len(optional_cond_strength ) == len(
+                optional_cond_images
+            ), "Number of optional cond images must match number of optional cond strength"
+            # New assertion to check if all strengths are between 0 and 1
+            assert all(0.0 <= s <= 1.0 for s in optional_cond_strength), "All optional cond strengths must be floats between 0 and 1"
+        else:
+            optional_cond_strength = None
 
         try:
             positive, negative = guider.raw_conds
@@ -192,12 +213,17 @@ class LTXVBaseSampler:
                 dtype=torch.float32,
                 device=latents["samples"].device,
             )
-            conditioning_latent_frames_mask[:, :, : t.shape[2]] = 1.0 - strength
+            if optional_cond_strength is not None:
+                conditioning_latent_frames_mask[:, :, : t.shape[2]] = 1.0 - strength
+            else:
+                conditioning_latent_frames_mask[:, :, : t.shape[2]] = 1.0 - optional_cond_strength[0]
             latents["noise_mask"] = conditioning_latent_frames_mask
 
         elif optional_cond_images is not None:
-            for cond_image, cond_idx in zip(
-                optional_cond_images, optional_cond_indices
+            cond_strengths_list = optional_cond_strength if optional_cond_strength is not None else [strength] * len(optional_cond_images)
+
+            for cond_image, cond_idx, cond_strength in zip(
+                optional_cond_images, optional_cond_indices, cond_strengths_list
             ):
                 (
                     positive,
@@ -210,7 +236,7 @@ class LTXVBaseSampler:
                     latent=latents,
                     image=cond_image.unsqueeze(0),
                     frame_idx=cond_idx,
-                    strength=strength,
+                    strength=cond_strength,
                 )
 
         if optional_negative_index_latents is not None:
@@ -307,6 +333,48 @@ class LTXVExtendSampler:
                     "LATENT",
                     {"tooltip": "Optional latents to guide the sampling."},
                 ),
+                "optional_cond_images": (
+                    "IMAGE",
+                    {"tooltip": "The images to use for conditioning the sampling."},
+                ),
+                "optional_cond_indices": (
+                    "STRING",
+                    {
+                        "tooltip": "The indices of the images to use for conditioning the sampling."
+                    },
+                ),
+                "optional_cond_strength": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "This allows specifying the strength of each image in the conditional using an index based approach of comma separated values"
+                    },
+                ),
+                "crop": (
+                    ["center", "disabled"],
+                    {
+                        "default": "disabled",
+                        "tooltip": "The crop mode to use for the images.",
+                    },
+                ),
+                "crf": (
+                    "INT",
+                    {
+                        "default": 35,
+                        "min": 0,
+                        "max": 100,
+                        "tooltip": "The CRF value to use for preprocessing the images.",
+                    },
+                ),
+                "blur": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 10,
+                        "tooltip": "The blur value to use for preprocessing the images.",
+                    },
+                ),
             },
         }
 
@@ -326,6 +394,12 @@ class LTXVExtendSampler:
         sampler,
         sigmas,
         noise,
+        crop="disabled",
+        crf=35,
+        blur=0,
+        optional_cond_images=None,
+        optional_cond_indices=None,
+        optional_cond_strength=None,
         strength=0.5,
         guiding_strength=1.0,
         optional_guiding_latents=None,
@@ -336,7 +410,6 @@ class LTXVExtendSampler:
         optional_negative_index=-1,
         optional_negative_index_strength=1.0,
     ):
-
         try:
             positive, negative = guider.raw_conds
         except AttributeError:
@@ -350,11 +423,55 @@ class LTXVExtendSampler:
         time_scale_factor, width_scale_factor, height_scale_factor = (
             vae.downscale_index_formula
         )
+        width = width * width_scale_factor
+        height = height * height_scale_factor
+
         overlap = frame_overlap // time_scale_factor
+
+        if optional_cond_images is not None:
+            assert optional_cond_indices is not None and bool(optional_cond_indices.strip()), "You must specify optional_cond_indices if optional_cond_images specified"
+            assert optional_cond_strength is not None and bool(optional_cond_strength.strip()), "You must specify optional_cond_strength if optional_cond_images specified"
+
+            optional_cond_images = (
+                comfy.utils.common_upscale(
+                    optional_cond_images.movedim(-1, 1),
+                    width,
+                    height,
+                    "bilinear",
+                    crop=crop,
+                )
+                .movedim(1, -1)
+                .clamp(0, 1)
+            )
+            optional_cond_images = comfy_extras.nodes_lt.LTXVPreprocess().preprocess(
+                optional_cond_images, crf
+            )[0]
+            for i in range(optional_cond_images.shape[0]):
+                optional_cond_images[i] = blur_internal(
+                    optional_cond_images[i].unsqueeze(0), blur
+                )
+
+        if optional_cond_indices is not None and optional_cond_images is not None:
+            optional_cond_indices = optional_cond_indices.split(",")
+            optional_cond_indices = [int(i) for i in optional_cond_indices]
+            assert len(optional_cond_indices) == len(
+                optional_cond_images
+            ), "Number of optional cond images must match number of optional cond indices"
+
+        if optional_cond_strength is not None and bool(optional_cond_strength.strip()) and optional_cond_images is not None:
+            optional_cond_strength = optional_cond_strength.split(",")
+            optional_cond_strength = [float(i) for i in optional_cond_strength]
+            assert len(optional_cond_strength ) == len(
+                optional_cond_images
+            ), "Number of optional cond images must match number of optional cond strength"
+            # New assertion to check if all strengths are between 0 and 1
+            assert all(0.0 <= s <= 1.0 for s in optional_cond_strength), "All optional cond strengths must be floats between 0 and 1"
+        else:
+            optional_cond_strength = None
 
         if num_new_frames == -1 and optional_guiding_latents is not None:
             num_new_frames = (
-                optional_guiding_latents["samples"].shape[2] - overlap
+                optional_guiding_latents["samples"].shape[2]
             ) * time_scale_factor
 
         (last_overlap_latents,) = LTXVSelectLatents().select_latents(
@@ -363,9 +480,9 @@ class LTXVExtendSampler:
 
         if optional_initialization_latents is None:
             new_latents = EmptyLTXVLatentVideo().generate(
-                width=width * width_scale_factor,
-                height=height * height_scale_factor,
-                length=overlap * time_scale_factor + num_new_frames,
+                width=width,
+                height=height,
+                length=overlap + num_new_frames,
                 batch_size=1,
             )[0]
         else:
@@ -388,6 +505,24 @@ class LTXVExtendSampler:
             latent_idx=0,
             strength=strength,
         )
+
+        if optional_cond_images is not None:
+            for cond_image, cond_idx, cond_strength in zip(
+                optional_cond_images, optional_cond_indices, optional_cond_strength
+            ):
+                (
+                    positive,
+                    negative,
+                    new_latents,
+                ) = LTXVAddGuide().generate(
+                    positive=positive,
+                    negative=negative,
+                    vae=vae,
+                    latent=new_latents,
+                    image=cond_image.unsqueeze(0),
+                    frame_idx=cond_idx + overlap,
+                    strength=cond_strength,
+                )
 
         if optional_guiding_latents is not None:
             optional_guiding_latents = LTXVSelectLatents().select_latents(
