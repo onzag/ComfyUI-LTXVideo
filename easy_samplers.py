@@ -862,8 +862,8 @@ class LTXVHybridSampler:
                     },
                 ),
                 "initial_video": (
-                    "IMAGE",
-                    {"tooltip": "The video to extend, use the Load Video to put a video in here"},
+                    "LATENT",
+                    {"tooltip": "The video to extend, use the Load Video and then VAE Encode it, otherwise load plain latents that you have saved, it is recommended to save the latents because the process of VAE Encode and VAE Decode and export as video causes losses"},
                 ),
                 "initial_video_strength": (
                     "FLOAT",
@@ -932,12 +932,17 @@ class LTXVHybridSampler:
             )
             return (latents, positive, negative, generated_frames_idx, reference_frames_idx, reference_frames_idx, latents)
 
-        v_frames, v_px_height, v_px_width, _ = initial_video.shape
+        samples = initial_video["samples"]
+        batch, channels, frames, v_height, v_width = samples.shape
+        time_scale_factor, width_scale_factor, height_scale_factor = (
+            vae.downscale_index_formula
+        )
+        v_px_height = v_height * height_scale_factor
+        v_px_width = v_width * width_scale_factor
+        v_frames = (frames * time_scale_factor) - 7
 
         assert v_px_width == width, "The width of the provided video and the width of the settings do not match, provided " + str(width) + " but the video is " + str(v_px_width)
         assert v_px_height == height, "The height of the provided video and the height of the settings do not match, provided " + str(height) + " but the video is " + str(v_px_height)
-
-        (initial_video_latents, ) = VAEEncode().encode(vae, initial_video)
 
         optional_cond_indices_created = None
         optional_cond_indices_created_relative = None
@@ -950,7 +955,7 @@ class LTXVHybridSampler:
         latents, positive, negative = LTXVExtendSampler().sample(
             model,
             vae,
-            initial_video_latents,
+            initial_video,
             num_frames,
             frame_overlap,
             guider,
@@ -1057,4 +1062,3 @@ class LinearOverlapLatentTransition:
                 "batch_index": combined_batch_index,
             },
         )
-
