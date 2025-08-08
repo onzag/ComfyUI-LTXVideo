@@ -213,7 +213,7 @@ class LTXVBaseSampler:
                 dtype=torch.float32,
                 device=latents["samples"].device,
             )
-            if optional_cond_strength is not None:
+            if optional_cond_strength is None:
                 conditioning_latent_frames_mask[:, :, : t.shape[2]] = 1.0 - strength
             else:
                 conditioning_latent_frames_mask[:, :, : t.shape[2]] = 1.0 - optional_cond_strength[0]
@@ -766,6 +766,222 @@ class LTXVInContextSampler:
         )
 
         return (denoised_output_latents, positive, negative)
+
+@comfy_node(
+    name="LTXVHybridSampler",
+)
+class LTXVHybridSampler:
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": "The diffusion model to use."}),
+                "vae": ("VAE", {"tooltip": "The VAE to use."}),
+                "width": (
+                    "INT",
+                    {
+                        "default": 768,
+                        "min": 64,
+                        "max": nodes.MAX_RESOLUTION,
+                        "step": 32,
+                    },
+                ),
+                "height": (
+                    "INT",
+                    {
+                        "default": 512,
+                        "min": 64,
+                        "max": nodes.MAX_RESOLUTION,
+                        "step": 32,
+                    },
+                ),
+                "num_frames": (
+                    "INT",
+                    {"default": 97, "min": 1, "max": nodes.MAX_RESOLUTION, "step": 8, "tooltip": "The number of frames to generate, if initial_video is specified the number of frames to extend with"},
+                ),
+                "guider": (
+                    "GUIDER",
+                    {"tooltip": "The guider to use, must be a STGGuiderAdvanced."},
+                ),
+                "sampler": ("SAMPLER", {"tooltip": "The sampler to use."}),
+                "sigmas": ("SIGMAS", {"tooltip": "The sigmas to use."}),
+                "noise": ("NOISE", {"tooltip": "The noise to use for the sampling."}),
+            },
+            "optional": {
+                "optional_cond_images": (
+                    "IMAGE",
+                    {"tooltip": "The images to use for conditioning the sampling."},
+                ),
+                "optional_cond_indices": (
+                    "STRING",
+                    {
+                        "tooltip": "The indices of the images to use for conditioning the sampling."
+                    },
+                ),
+                "optional_cond_strength": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "tooltip": "This allows specifying the strength of each image in the conditional using an index based approach of comma separated values"
+                    },
+                ),
+                "crop": (
+                    ["center", "disabled"],
+                    {
+                        "default": "center",
+                        "tooltip": "The crop mode to use for the images.",
+                    },
+                ),
+                "crf": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 100,
+                        "tooltip": "The CRF value to use for preprocessing the images.",
+                    },
+                ),
+                "blur": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 10,
+                        "tooltip": "The blur value to use for preprocessing the images.",
+                    },
+                ),
+                "frame_overlap": (
+                    "INT",
+                    {
+                        "default": 16,
+                        "min": 16,
+                        "max": 128,
+                        "step": 8,
+                        "tooltip": "The overlap region to use for conditioning the new frames on the end of the provided initial_video latents",
+                    },
+                ),
+                "initial_video": (
+                    "IMAGE",
+                    {"tooltip": "The video to extend, use the Load Video to put a video in here"},
+                ),
+                "initial_video_strength": (
+                    "FLOAT",
+                    {
+                        "default": 0.5,
+                        "min": 0,
+                        "max": 1,
+                        "tooltip": "The strength of the conditioning on the initial video",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT", "CONDITIONING", "CONDITIONING", "STRING", "STRING")
+    RETURN_NAMES = ("denoised_output", "positive", "negative", "generated_frames_idx", "reference_frames_idx")
+    FUNCTION = "sample"
+    CATEGORY = "sampling"
+
+    def sample(
+        self,
+        model,
+        vae,
+        width,
+        height,
+        num_frames,
+        guider,
+        sampler,
+        sigmas,
+        noise,
+        initial_video=None,
+        initial_video_strength=0.5,
+        frame_overlap=16,
+        optional_cond_images=None,
+        optional_cond_indices=None,
+        optional_cond_strength=None,
+        crop="disabled",
+        crf=35,
+        blur=0,
+        optional_negative_index_latents=None,
+        optional_negative_index=-1,
+        optional_negative_index_strength=1.0,
+        optional_initialization_latents=None,
+    ):
+        if initial_video is None:
+            generated_frames_idx = list(range(0, num_frames))
+            generated_frames_idx = ",".join(map(str, generated_frames_idx))
+
+            reference_frames_idx = "" if optional_cond_indices is None else optional_cond_indices
+            latents, positive, negative = LTXVBaseSampler().sample(
+                model,
+                vae,
+                width,
+                height,
+                num_frames,
+                guider,
+                sampler,
+                sigmas,
+                noise,
+                optional_cond_images=optional_cond_images,
+                optional_cond_indices=optional_cond_indices,
+                optional_cond_strength=optional_cond_strength,
+                strength=None,
+                crop=crop,
+                crf=crf,
+                blur=blur,
+            )
+            return (latents, positive, negative, generated_frames_idx, reference_frames_idx)
+
+        v_frames, v_px_height, v_px_width, _ = initial_video.shape
+
+        assert v_px_width == width, "The width of the provided video and the width of the settings do not match, provided " + str(width) + " but the video is " + str(v_px_width)
+        assert v_px_height == height, "The height of the provided video and the height of the settings do not match, provided " + str(height) + " but the video is " + str(v_px_height)
+
+        (initial_video_latents, ) = VAEEncode().encode(vae, initial_video)
+
+        optional_cond_indices_created = None
+        if optional_cond_indices is not None:
+            print("cond indexes are", optional_cond_indices)
+            optional_cond_indices_created = optional_cond_indices.split(",")
+            optional_cond_indices_created = [int(i) for i in optional_cond_indices_created]
+
+        latents, positive, negative = LTXVExtendSampler().sample(
+            model,
+            vae,
+            initial_video_latents,
+            num_frames,
+            frame_overlap,
+            guider,
+            sampler,
+            sigmas,
+            noise,
+            crop=crop,
+            crf=crf,
+            blur=blur,
+            optional_cond_images=optional_cond_images,
+            optional_cond_indices=optional_cond_indices,
+            optional_cond_strength=optional_cond_strength,
+            strength=initial_video_strength,
+        )
+
+        # the extend sampler at the end removes 9 frames
+        # tried to somehow calculate it from the tensor but this wasn't possible
+        # or at least couldn't reliably figure out the 9 otherwise, but with the 8+1
+        # LTXV rule, I assumed it was always 9
+        actual_num_frames = num_frames - 9;
+
+        generated_frames_idx = list(range(v_frames, v_frames + actual_num_frames))
+        generated_frames_idx = ",".join(map(str, generated_frames_idx))
+
+        # so we want to figure what the difference was between the frames created and the number of frames
+        diff_frames = actual_num_frames - num_frames
+        # and then we want to shift our conditional indices that way, first since the diff frames are removed at the start, and well
+        # it is a negative number we add that, and then add the whole video frames that shift the whole thing
+        optional_cond_indices_created = [str(n + diff_frames + v_frames) for n in optional_cond_indices_created]
+        
+        reference_frames_idx = ",".join(optional_cond_indices_created)
+
+        return (latents, positive, negative, generated_frames_idx, reference_frames_idx) 
 
 
 @comfy_node(description="Linear transition with overlap")
