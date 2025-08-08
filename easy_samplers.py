@@ -877,8 +877,8 @@ class LTXVHybridSampler:
             },
         }
 
-    RETURN_TYPES = ("LATENT", "CONDITIONING", "CONDITIONING", "STRING", "STRING")
-    RETURN_NAMES = ("denoised_output", "positive", "negative", "generated_frames_idx", "reference_frames_idx")
+    RETURN_TYPES = ("LATENT", "CONDITIONING", "CONDITIONING", "STRING", "STRING", "STRING", "LATENT")
+    RETURN_NAMES = ("denoised_output", "positive", "negative", "generated_frames_idx", "reference_frames_idx", "relative_reference_frames_idx", "denoised_output_only_generated")
     FUNCTION = "sample"
     CATEGORY = "sampling"
 
@@ -930,7 +930,7 @@ class LTXVHybridSampler:
                 crf=crf,
                 blur=blur,
             )
-            return (latents, positive, negative, generated_frames_idx, reference_frames_idx)
+            return (latents, positive, negative, generated_frames_idx, reference_frames_idx, reference_frames_idx, latents)
 
         v_frames, v_px_height, v_px_width, _ = initial_video.shape
 
@@ -940,9 +940,11 @@ class LTXVHybridSampler:
         (initial_video_latents, ) = VAEEncode().encode(vae, initial_video)
 
         optional_cond_indices_created = None
+        optional_cond_indices_created_relative = None
         if optional_cond_indices is not None:
             print("cond indexes are", optional_cond_indices)
             optional_cond_indices_created = optional_cond_indices.split(",")
+            optional_cond_indices_created_relative = [int(i) for i in optional_cond_indices_created]
             optional_cond_indices_created = [int(i) for i in optional_cond_indices_created]
 
         latents, positive, negative = LTXVExtendSampler().sample(
@@ -978,10 +980,16 @@ class LTXVHybridSampler:
         # and then we want to shift our conditional indices that way, first since the diff frames are removed at the start, and well
         # it is a negative number we add that, and then add the whole video frames that shift the whole thing
         optional_cond_indices_created = [str(n + diff_frames + v_frames) for n in optional_cond_indices_created]
+        optional_cond_indices_created_relative = [str(n + diff_frames) for n in optional_cond_indices_created_relative]
         
         reference_frames_idx = ",".join(optional_cond_indices_created)
+        relative_reference_frames_idx = ",".join(optional_cond_indices_created_relative)
 
-        return (latents, positive, negative, generated_frames_idx, reference_frames_idx) 
+        (reference_createdonly_latents,) = LTXVSelectLatents().select_latents(
+            latents, int(-((num_frames - 1) / 8)), -1
+        )
+
+        return (latents, positive, negative, generated_frames_idx, reference_frames_idx, relative_reference_frames_idx, reference_createdonly_latents) 
 
 
 @comfy_node(description="Linear transition with overlap")
@@ -1049,3 +1057,4 @@ class LinearOverlapLatentTransition:
                 "batch_index": combined_batch_index,
             },
         )
+
