@@ -1041,7 +1041,6 @@ class LTXVHybridSampler:
         optional_cond_indices_created = None
         optional_cond_indices_created_relative = None
         if optional_cond_indices is not None:
-            print("cond indexes are", optional_cond_indices)
             optional_cond_indices_created = optional_cond_indices.split(",")
             optional_cond_indices_created_relative = [int(i) for i in optional_cond_indices_created]
             optional_cond_indices_created = [int(i) for i in optional_cond_indices_created]
