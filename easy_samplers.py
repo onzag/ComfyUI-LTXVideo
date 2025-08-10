@@ -7,6 +7,7 @@ import torch
 from comfy_extras.nodes_custom_sampler import SamplerCustomAdvanced
 from comfy_extras.nodes_lt import EmptyLTXVLatentVideo, LTXVAddGuide, LTXVCropGuides
 from nodes import VAEEncode
+import json
 
 from .guide import blur_internal
 from .latent_adain import LTXVAdainLatent
@@ -107,6 +108,13 @@ class LTXVBaseSampler:
                         "tooltip": "This allows specifying the strength of each image in the conditional using an index based approach of comma separated values, note this will override strength"
                     },
                 ),
+                "optional_cond_use_latent_guide": (
+                    "STRING",
+                    {
+                        "default": "f",
+                        "tooltip": "Comma separated value of f and t, if f it will use LTXVAddGuide which allows for specific frame forceful guiding, if t it will use LTXVAddLatentGuide acting more like a negative index reference; false is usually the better"
+                    },
+                ),
             },
         }
 
@@ -128,7 +136,6 @@ class LTXVBaseSampler:
         noise,
         optional_cond_images=None,
         optional_cond_indices=None,
-        optional_cond_strength=None,
         strength=0.9,
         crop="disabled",
         crf=35,
@@ -137,6 +144,8 @@ class LTXVBaseSampler:
         optional_negative_index=-1,
         optional_negative_index_strength=1.0,
         optional_initialization_latents=None,
+        optional_cond_strength=None,
+        optional_cond_use_latent_guide=None,
     ):
         if optional_cond_images is not None:
             assert optional_cond_indices is not None and bool(optional_cond_indices.strip()), "You must specify optional_cond_indices if optional_cond_images specified"
@@ -179,6 +188,16 @@ class LTXVBaseSampler:
         else:
             optional_cond_strength = None
 
+        if optional_cond_use_latent_guide is not None and bool(optional_cond_use_latent_guide.strip()) and optional_cond_images is not None:
+            optional_cond_use_latent_guide = optional_cond_use_latent_guide.split(",")
+            assert len(optional_cond_use_latent_guide) == len(
+                optional_cond_images
+            ), "Number of optional cond use latent guide must match number of optional cond strength"
+            # New assertion to check if all strengths are between 0 and 1
+            assert all(s == "t" or s == "f" for s in optional_cond_use_latent_guide), "All optional cond use latent guide must be t or f"
+        else:
+            optional_cond_use_latent_guide = None
+
         try:
             positive, negative = guider.raw_conds
         except AttributeError:
@@ -195,7 +214,11 @@ class LTXVBaseSampler:
         if (
             optional_cond_images is not None
             and optional_cond_images.shape[0] == 1
-            and optional_cond_indices[0] == 0
+            and optional_cond_indices[0] == 0 and
+            (
+                optional_cond_use_latent_guide is None or
+                optional_cond_use_latent_guide[0] == "f"
+            )
         ):
             pixels = comfy.utils.common_upscale(
                 optional_cond_images[0].unsqueeze(0).movedim(-1, 1),
@@ -221,23 +244,44 @@ class LTXVBaseSampler:
 
         elif optional_cond_images is not None:
             cond_strengths_list = optional_cond_strength if optional_cond_strength is not None else [strength] * len(optional_cond_images)
+            cond_use_latent_guide_list = optional_cond_use_latent_guide if optional_cond_use_latent_guide is not None else ["f"] * len(optional_cond_images)
 
-            for cond_image, cond_idx, cond_strength in zip(
-                optional_cond_images, optional_cond_indices, cond_strengths_list
+            for cond_image, cond_idx, cond_strength, cond_use_latent_guide in zip(
+                optional_cond_images, optional_cond_indices, cond_strengths_list, cond_use_latent_guide_list
             ):
-                (
-                    positive,
-                    negative,
-                    latents,
-                ) = LTXVAddGuide().generate(
-                    positive=positive,
-                    negative=negative,
-                    vae=vae,
-                    latent=latents,
-                    image=cond_image.unsqueeze(0),
-                    frame_idx=cond_idx,
-                    strength=cond_strength,
-                )
+                if cond_use_latent_guide == "f":
+                    (
+                        positive,
+                        negative,
+                        latents,
+                   ) = LTXVAddGuide().generate(
+                        positive=positive,
+                        negative=negative,
+                        vae=vae,
+                        latent=latents,
+                        image=cond_image.unsqueeze(0),
+                        frame_idx=cond_idx,
+                        strength=cond_strength,
+                    )
+                else:
+                    time_scale_factor, _, _ = (
+                        vae.downscale_index_formula
+                    )
+                    latent_idx = int(cond_idx // time_scale_factor)
+                    (cond_image_latent,) = VAEEncode().encode(vae, cond_image.unsqueeze(0))
+                    (
+                        positive,
+                        negative,
+                        latents,
+                    ) = LTXVAddLatentGuide().generate(
+                        vae=vae,
+                        positive=positive,
+                        negative=negative,
+                        latent=latents,
+                        guiding_latent=cond_image_latent,
+                        latent_idx=latent_idx,
+                        strength=optional_cond_strength,
+                    )
 
         if optional_negative_index_latents is not None:
             (
@@ -375,6 +419,13 @@ class LTXVExtendSampler:
                         "tooltip": "The blur value to use for preprocessing the images.",
                     },
                 ),
+                "optional_cond_use_latent_guide": (
+                    "STRING",
+                    {
+                        "default": "f",
+                        "tooltip": "Comma separated value of f and t, if f it will use LTXVAddGuide which allows for specific frame forceful guiding, if t it will use LTXVAddLatentGuide acting more like a negative index reference; false is usually the better"
+                    },
+                ),
             },
         }
 
@@ -394,12 +445,6 @@ class LTXVExtendSampler:
         sampler,
         sigmas,
         noise,
-        crop="disabled",
-        crf=35,
-        blur=0,
-        optional_cond_images=None,
-        optional_cond_indices=None,
-        optional_cond_strength=None,
         strength=0.5,
         guiding_strength=1.0,
         optional_guiding_latents=None,
@@ -409,6 +454,13 @@ class LTXVExtendSampler:
         optional_negative_index_latents=None,
         optional_negative_index=-1,
         optional_negative_index_strength=1.0,
+        crop="disabled",
+        crf=35,
+        blur=0,
+        optional_cond_images=None,
+        optional_cond_indices=None,
+        optional_cond_strength=None,
+        optional_cond_use_latent_guide=None,
     ):
         try:
             positive, negative = guider.raw_conds
@@ -469,6 +521,16 @@ class LTXVExtendSampler:
         else:
             optional_cond_strength = None
 
+        if optional_cond_use_latent_guide is not None and bool(optional_cond_use_latent_guide.strip()) and optional_cond_images is not None:
+            optional_cond_use_latent_guide = optional_cond_use_latent_guide.split(",")
+            assert len(optional_cond_use_latent_guide) == len(
+                optional_cond_images
+            ), "Number of optional cond use latent guide must match number of optional cond strength"
+            # New assertion to check if all strengths are between 0 and 1
+            assert all(s == "t" or s == "f" for s in optional_cond_use_latent_guide), "All optional cond use latent guide must be t or f"
+        else:
+            optional_cond_use_latent_guide = None
+
         if num_new_frames == -1 and optional_guiding_latents is not None:
             num_new_frames = (
                 optional_guiding_latents["samples"].shape[2]
@@ -482,7 +544,7 @@ class LTXVExtendSampler:
             new_latents = EmptyLTXVLatentVideo().generate(
                 width=width,
                 height=height,
-                length=overlap + num_new_frames,
+                length=(overlap * time_scale_factor) + num_new_frames,
                 batch_size=1,
             )[0]
         else:
@@ -507,27 +569,55 @@ class LTXVExtendSampler:
         )
 
         if optional_cond_images is not None:
-            for cond_image, cond_idx, cond_strength in zip(
-                optional_cond_images, optional_cond_indices, optional_cond_strength
+            cond_strengths_list = optional_cond_strength if optional_cond_strength is not None else [1] * len(optional_cond_images)
+            cond_use_latent_guide_list = optional_cond_use_latent_guide if optional_cond_use_latent_guide is not None else ["f"] * len(optional_cond_images)
+            for cond_image, cond_idx, cond_strength, cond_use_latent_guide in zip(
+                optional_cond_images, optional_cond_indices, cond_strengths_list, cond_use_latent_guide_list
             ):
-                (
-                    positive,
-                    negative,
-                    new_latents,
-                ) = LTXVAddGuide().generate(
-                    positive=positive,
-                    negative=negative,
-                    vae=vae,
-                    latent=new_latents,
-                    image=cond_image.unsqueeze(0),
-                    frame_idx=cond_idx + overlap,
-                    strength=cond_strength,
-                )
+                if cond_use_latent_guide == "f":
+                    (
+                        positive,
+                        negative,
+                        new_latents,
+                    ) = LTXVAddGuide().generate(
+                        positive=positive,
+                        negative=negative,
+                        vae=vae,
+                        latent=new_latents,
+                        image=cond_image.unsqueeze(0),
+                        frame_idx=cond_idx + frame_overlap,
+                        strength=cond_strength,
+                    )
+                else:
+                    time_scale_factor, _, _ = (
+                        vae.downscale_index_formula
+                    )
+                    latent_idx = int((cond_idx + frame_overlap) // time_scale_factor)
+                    (cond_image_latent,) = VAEEncode().encode(vae, cond_image.unsqueeze(0))
+                    (
+                        positive,
+                        negative,
+                        new_latents,
+                    ) = LTXVAddLatentGuide().generate(
+                        vae=vae,
+                        positive=positive,
+                        negative=negative,
+                        latent=new_latents,
+                        guiding_latent=cond_image_latent,
+                        latent_idx=latent_idx,
+                        strength=cond_strength,
+                    )
 
         if optional_guiding_latents is not None:
-            optional_guiding_latents = LTXVSelectLatents().select_latents(
-                optional_guiding_latents, overlap, -1
-            )[0]
+            # this seems to be wrong, it's chopping my guiding latent start frames
+            # and then setting them to the end, instead it should go as it is, ensuring that
+            # any first guided action happens even if end actions get cropped (which means you must increase num_frames)
+            # if num_frames was specified
+            #optional_guiding_latents = LTXVSelectLatents().select_latents(
+            #    optional_guiding_latents, overlap, -1
+            #)[0]
+
+            #now the guiding latents start where it ended, even if the end is chopped off
             (
                 positive,
                 negative,
@@ -681,6 +771,13 @@ class LTXVInContextSampler:
                         "tooltip": "A the strength to use for the latent guiding"
                     },
                 ),
+                "optional_cond_use_latent_guide": (
+                    "STRING",
+                    {
+                        "default": "t",
+                        "tooltip": "Comma separated value of f and t, if f it will use LTXVAddGuide which allows for specific frame forceful guiding, if t it will use LTXVAddLatentGuide acting more like a negative index reference; false is more accurate in the case of this sampler true was the default as it creates a weak reference"
+                    },
+                ),
             },
         }
 
@@ -707,6 +804,7 @@ class LTXVInContextSampler:
         optional_guiding_strength=1.0,
         optional_cond_image_strength=None,
         optional_cond_image_indices="0",
+        optional_cond_use_latent_guide=None,
         crop="disabled",
         crf=35,
         blur=0,
@@ -780,32 +878,84 @@ class LTXVInContextSampler:
         else:
             optional_cond_strength = None
 
+        if optional_cond_use_latent_guide is not None and bool(optional_cond_use_latent_guide.strip()) and optional_cond_image is not None:
+            optional_cond_use_latent_guide = optional_cond_use_latent_guide.split(",")
+            assert len(optional_cond_use_latent_guide) == len(
+                optional_cond_image
+            ), "Number of optional cond use latent guide must match number of optional cond strength"
+            # New assertion to check if all strengths are between 0 and 1
+            assert all(s == "t" or s == "f" for s in optional_cond_use_latent_guide), "All optional cond use latent guide must be t or f"
+        else:
+            optional_cond_use_latent_guide = None
+
         time_scale_factor, width_scale_factor, height_scale_factor = (
             vae.downscale_index_formula
         )
 
-        if optional_cond_image is not None:
-            cond_strengths_list = optional_cond_image_strength if optional_cond_image_strength is not None else [optional_cond_strength] * len(optional_cond_image)
+        found_zero_index = False
+        zero_index_matters = False
+        zero_index_has_power_1 = False
+        zero_index_has_t = False
 
-            for cond_image, cond_idx, cond_strength in zip(
-                optional_cond_image, optional_cond_image_indices, cond_strengths_list
+        if optional_cond_image is not None:
+
+            zero_index_matters = True
+
+            cond_strengths_list = optional_cond_image_strength if optional_cond_image_strength is not None else [optional_cond_strength] * len(optional_cond_image)
+            cond_use_latent_guide_list = optional_cond_use_latent_guide if optional_cond_use_latent_guide is not None else ["f"] * len(optional_cond_image)
+            if (optional_cond_use_latent_guide is None):
+                cond_use_latent_guide_list[0] = "t"
+
+            for cond_image, cond_idx, cond_strength, cond_use_latent_guide in zip(
+                optional_cond_image, optional_cond_image_indices, cond_strengths_list, cond_use_latent_guide_list
             ):
-                latent_idx = int(cond_idx // time_scale_factor)
-                #TODO maybe something else for image that isnt first
-                (cond_image_latent,) = VAEEncode().encode(vae, cond_image.unsqueeze(0))
-                (
-                    positive,
-                    negative,
-                    new_latents,
-                ) = LTXVAddLatentGuide().generate(
-                    vae=vae,
-                    positive=positive,
-                    negative=negative,
-                    latent=new_latents,
-                    guiding_latent=cond_image_latent,
-                    latent_idx=latent_idx,
-                    strength=optional_cond_strength,
-                )
+                if cond_idx == 0:
+                    found_zero_index = True
+
+                if cond_strength == 1 and cond_idx == 0:
+                    zero_index_has_power_1 = True
+
+                if cond_use_latent_guide == "t" and cond_idx == 0:
+                    zero_index_has_t = True
+
+                if (cond_use_latent_guide == "f"):
+                    (
+                        positive,
+                        negative,
+                        new_latents,
+                    ) = LTXVAddGuide().generate(
+                        positive=positive,
+                        negative=negative,
+                        vae=vae,
+                        latent=new_latents,
+                        image=cond_image.unsqueeze(0),
+                        frame_idx=cond_idx,
+                        strength=cond_strength,
+                    )
+                else:
+                    latent_idx = int(cond_idx // time_scale_factor)
+                    (cond_image_latent,) = VAEEncode().encode(vae, cond_image.unsqueeze(0))
+                    (
+                        positive,
+                        negative,
+                        new_latents,
+                    ) = LTXVAddLatentGuide().generate(
+                        vae=vae,
+                        positive=positive,
+                        negative=negative,
+                        latent=new_latents,
+                        guiding_latent=cond_image_latent,
+                        latent_idx=latent_idx,
+                        strength=cond_strength,
+                    )
+
+        if zero_index_matters:
+            if not found_zero_index:
+                print("### The initial image was not found this will result in arbitrary video")
+            elif not zero_index_has_power_1:
+                print("### The initial image has a strength lower than 1, this will result in video with less adherence to the initial image")
+            elif not zero_index_has_t:
+                print("### The initial image was used as a image guide rather than a latent guide, the default LTXV Behaviour is using it as a latent guide")
 
         if optional_cond_image is not None:
             guiding_latents = LTXVSelectLatents().select_latents(
@@ -968,11 +1118,33 @@ class LTXVHybridSampler:
                         "tooltip": "The strength of the conditioning on the initial video",
                     },
                 ),
+                "optional_cond_use_latent_guide": (
+                    "STRING",
+                    {
+                        "default": "f",
+                        "tooltip": "Comma separated value of f and t, if f it will use LTXVAddGuide which allows for specific frame forceful guiding, if t it will use LTXVAddLatentGuide acting more like a negative index reference; false is usually the better when no guiding_video used, otherwise true is good on a first frame when using a guiding video reference, eg. 'f,f,f' for base generation with only an image, 't,f,f' for base generation with a guiding video and 'f,f,f' again when initial_video specified since you should not use frame zero when extending"
+                    },
+                ),
+                "guiding_video": (
+                    "LATENT",
+                    {
+                        "tooltip": "The guiding video to use to guide the generation, use with the guiding mechanism, remember to use either depth, pose or canny in the workflow",
+                    },
+                ),
+                "guiding_video_strength": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0,
+                        "max": 1,
+                        "tooltip": "The strength of the conditioning on the guiding video",
+                    },
+                ),
             },
         }
 
-    RETURN_TYPES = ("LATENT", "CONDITIONING", "CONDITIONING", "STRING", "STRING", "STRING", "LATENT")
-    RETURN_NAMES = ("denoised_output", "positive", "negative", "generated_frames_idx", "reference_frames_idx", "relative_reference_frames_idx", "denoised_output_only_generated")
+    RETURN_TYPES = ("LATENT", "CONDITIONING", "CONDITIONING", "STRING", "STRING", "STRING", "LATENT", "STRING")
+    RETURN_NAMES = ("denoised_output", "positive", "negative", "generated_frames_idx", "reference_frames_idx", "relative_reference_frames_idx", "denoised_output_only_generated", "chunk_info")
     FUNCTION = "sample"
     CATEGORY = "sampling"
 
@@ -993,18 +1165,16 @@ class LTXVHybridSampler:
         optional_cond_images=None,
         optional_cond_indices=None,
         optional_cond_strength=None,
+        optional_cond_use_latent_guide=None,
         crop="disabled",
         crf=35,
         blur=0,
-        optional_negative_index_latents=None,
-        optional_negative_index=-1,
-        optional_negative_index_strength=1.0,
-        optional_initialization_latents=None,
+        guiding_video=None,
+        guiding_video_strength=1.0,
     ):
-        if initial_video is None:
+        if initial_video is None and guiding_video is None:
             generated_frames_idx = list(range(0, num_frames))
             generated_frames_idx = ",".join(map(str, generated_frames_idx))
-
             reference_frames_idx = "" if optional_cond_indices is None else optional_cond_indices
             latents, positive, negative = LTXVBaseSampler().sample(
                 model,
@@ -1019,18 +1189,87 @@ class LTXVHybridSampler:
                 optional_cond_images=optional_cond_images,
                 optional_cond_indices=optional_cond_indices,
                 optional_cond_strength=optional_cond_strength,
+                optional_cond_use_latent_guide=optional_cond_use_latent_guide,
                 strength=None,
                 crop=crop,
                 crf=crf,
                 blur=blur,
             )
-            return (latents, positive, negative, generated_frames_idx, reference_frames_idx, reference_frames_idx, latents)
 
-        samples = initial_video["samples"]
-        batch, channels, frames, v_height, v_width = samples.shape
+            info_dict = {
+                "cond_indices": None if optional_cond_indices is None else optional_cond_indices,
+                "cond_strengths": None if optional_cond_strength is None else optional_cond_strength,
+                "cond_use_latent_guide": None if optional_cond_use_latent_guide is None else optional_cond_use_latent_guide,
+                "num_frames_requested": num_frames,
+                "frames_generated": num_frames,
+                "images_used": 0 if optional_cond_images is None else len(optional_cond_images),
+                "crf": crf,
+                "blur": blur,
+                "crop": crop,
+                "frame_overlap": frame_overlap,
+            }
+            return (latents, positive, negative, generated_frames_idx, reference_frames_idx, reference_frames_idx, latents, json.dumps(info_dict))
+
         time_scale_factor, width_scale_factor, height_scale_factor = (
             vae.downscale_index_formula
         )
+
+        gv_px_height = None
+        gv_px_width = None
+        gv_frames = None
+
+        if guiding_video is not None:
+            g_samples = guiding_video["samples"]
+            _, _, g_frames, gv_height, gv_width = g_samples.shape
+            
+            gv_px_height = gv_height * height_scale_factor
+            gv_px_width = gv_width * width_scale_factor
+            gv_frames = (g_frames * time_scale_factor) - 7
+
+            assert gv_px_width == width, "The width of the guiding video and the width of the settings do not match, provided " + str(width) + " but the guiding video is " + str(gv_px_width)
+            assert gv_px_height == height, "The height of the guiding video and the height of the settings do not match, provided " + str(height) + " but the guiding video is " + str(gv_px_height)
+            assert gv_frames == num_frames, "The number of frames of the guiding video and the number of frames of the settings differs  " + str(num_frames) + " but the guiding video is " + str(gv_frames) + " set your frames to " + str(gv_frames)
+
+            if initial_video is None:
+                generated_frames_idx = list(range(0, num_frames))
+                generated_frames_idx = ",".join(map(str, generated_frames_idx))
+                reference_frames_idx = "" if optional_cond_indices is None else optional_cond_indices
+
+                latents, positive, negative = LTXVInContextSampler().sample(
+                    vae,
+                    guider,
+                    sampler,
+                    sigmas,
+                    noise,
+                    guiding_video,
+                    optional_cond_image=optional_cond_images,
+                    num_frames=-1,
+                    optional_cond_image_indices=optional_cond_indices,
+                    optional_cond_image_strength=optional_cond_strength,
+                    optional_cond_use_latent_guide=optional_cond_use_latent_guide,
+                    optional_guiding_strength=guiding_video_strength,
+                    crop=crop,
+                    crf=crf,
+                    blur=blur,
+                )
+
+                info_dict = {
+                    "cond_indices": None if optional_cond_indices is None else optional_cond_indices,
+                    "cond_strengths": None if optional_cond_strength is None else optional_cond_strength,
+                    "cond_use_latent_guide": None if optional_cond_use_latent_guide is None else optional_cond_use_latent_guide,
+                    "num_frames_requested": num_frames,
+                    "frames_generated": num_frames,
+                    "images_used": 0 if optional_cond_images is None else len(optional_cond_images),
+                    "crf": crf,
+                    "blur": blur,
+                    "crop": crop,
+                    "frame_overlap": frame_overlap,
+                }
+
+                return (latents, positive, negative, generated_frames_idx, reference_frames_idx, reference_frames_idx, latents, json.dumps(info_dict))
+
+        samples = initial_video["samples"]
+        batch, channels, frames, v_height, v_width = samples.shape
         v_px_height = v_height * height_scale_factor
         v_px_width = v_width * width_scale_factor
         v_frames = (frames * time_scale_factor) - 7
@@ -1040,7 +1279,7 @@ class LTXVHybridSampler:
 
         optional_cond_indices_created = None
         optional_cond_indices_created_relative = None
-        if optional_cond_indices is not None:
+        if optional_cond_indices is not None and optional_cond_indices:
             optional_cond_indices_created = optional_cond_indices.split(",")
             optional_cond_indices_created_relative = [int(i) for i in optional_cond_indices_created]
             optional_cond_indices_created = [int(i) for i in optional_cond_indices_created]
@@ -1055,13 +1294,16 @@ class LTXVHybridSampler:
             sampler,
             sigmas,
             noise,
+            strength=initial_video_strength,
+            guiding_strength=guiding_video_strength,
             crop=crop,
             crf=crf,
             blur=blur,
+            optional_guiding_latents=guiding_video,
             optional_cond_images=optional_cond_images,
             optional_cond_indices=optional_cond_indices,
             optional_cond_strength=optional_cond_strength,
-            strength=initial_video_strength,
+            optional_cond_use_latent_guide=optional_cond_use_latent_guide,
         )
 
         # the extend sampler at the end removes 9 frames
@@ -1077,8 +1319,8 @@ class LTXVHybridSampler:
         diff_frames = actual_num_frames - num_frames
         # and then we want to shift our conditional indices that way, first since the diff frames are removed at the start, and well
         # it is a negative number we add that, and then add the whole video frames that shift the whole thing
-        optional_cond_indices_created = [str(n + diff_frames + v_frames) for n in optional_cond_indices_created]
-        optional_cond_indices_created_relative = [str(n + diff_frames) for n in optional_cond_indices_created_relative]
+        optional_cond_indices_created = [str(n + diff_frames + v_frames) for n in optional_cond_indices_created] if optional_cond_indices_created is not None else []
+        optional_cond_indices_created_relative = [str(n + diff_frames) for n in optional_cond_indices_created_relative] if optional_cond_indices_created_relative is not None else []
         
         reference_frames_idx = ",".join(optional_cond_indices_created)
         relative_reference_frames_idx = ",".join(optional_cond_indices_created_relative)
@@ -1087,7 +1329,20 @@ class LTXVHybridSampler:
             latents, int(-((num_frames - 1) / 8)), -1
         )
 
-        return (latents, positive, negative, generated_frames_idx, reference_frames_idx, relative_reference_frames_idx, reference_createdonly_latents) 
+        info_dict = {
+            "cond_indices": None if optional_cond_indices is None else optional_cond_indices,
+            "cond_strengths": None if optional_cond_strength is None else optional_cond_strength,
+            "cond_use_latent_guide": None if optional_cond_use_latent_guide is None else optional_cond_use_latent_guide,
+            "num_frames_requested": num_frames,
+            "frames_generated": actual_num_frames,
+            "images_used": 0 if optional_cond_images is None else len(optional_cond_images),
+            "crf": crf,
+            "blur": blur,
+            "crop": crop,
+            "frame_overlap": frame_overlap,
+        }
+
+        return (latents, positive, negative, generated_frames_idx, reference_frames_idx, relative_reference_frames_idx, reference_createdonly_latents, info_dict) 
 
 
 @comfy_node(description="Linear transition with overlap")
@@ -1155,3 +1410,4 @@ class LinearOverlapLatentTransition:
                 "batch_index": combined_batch_index,
             },
         )
+
