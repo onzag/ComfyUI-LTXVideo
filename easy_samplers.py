@@ -140,7 +140,7 @@ class LTXVBaseSampler:
     ):
         if optional_cond_images is not None:
             assert optional_cond_indices is not None and bool(optional_cond_indices.strip()), "You must specify optional_cond_indices if optional_cond_images specified"
-            assert optional_cond_strength is not None and bool(optional_cond_strength.strip()), "You must specify optional_cond_strength if optional_cond_images specified"
+            assert (optional_cond_strength is not None and bool(optional_cond_strength.strip())) or strength is not None, "You must specify optional_cond_strength or strength if optional_cond_images specified"
 
             optional_cond_images = (
                 comfy.utils.common_upscale(
@@ -622,7 +622,7 @@ class LTXVInContextSampler:
                 "optional_cond_image": (
                     "IMAGE",
                     {
-                        "tooltip": "The image to use for conditioning the sampling, if not provided, the sampling will be unconditioned (t2v setup). The image will be resized to the size of the first frame."
+                        "tooltip": "The images to use for conditioning the sampling, if not provided, the sampling will be unconditioned (t2v setup). The image will be resized to the size of the first frame."
                     },
                 ),
                 "num_frames": (
@@ -633,6 +633,52 @@ class LTXVInContextSampler:
                         "max": 1000,
                         "step": 1,
                         "tooltip": "If -1, the number of frames will be based on the number of frames in the guiding_latents.",
+                    },
+                ),
+                "optional_cond_image_indices": (
+                    "STRING",
+                    {
+                        "tooltip": "A comma separated value for the image indices for use in the video generation to add a latent guide"
+                    },
+                ),
+                "optional_cond_image_strength": (
+                    "STRING",
+                    {
+                        "tooltip": "A comma separated value for the image strengths for use in the video generation to add a latent guide"
+                    },
+                ),
+                "crop": (
+                    ["center", "disabled"],
+                    {
+                        "default": "disabled",
+                        "tooltip": "The crop mode to use for the images.",
+                    },
+                ),
+                "crf": (
+                    "INT",
+                    {
+                        "default": 35,
+                        "min": 0,
+                        "max": 100,
+                        "tooltip": "The CRF value to use for preprocessing the images.",
+                    },
+                ),
+                "blur": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 10,
+                        "tooltip": "The blur value to use for preprocessing the images.",
+                    },
+                ),
+                "optional_guiding_strength": (
+                    "FLOAT",
+                    {
+                        "default": 1,
+                        "min": 0,
+                        "max": 1,
+                        "tooltip": "A the strength to use for the latent guiding"
                     },
                 ),
             },
@@ -659,6 +705,11 @@ class LTXVInContextSampler:
         optional_negative_index_strength=1.0,
         optional_cond_strength=1.0,
         optional_guiding_strength=1.0,
+        optional_cond_image_strength=None,
+        optional_cond_image_indices="0",
+        crop="disabled",
+        crf=35,
+        blur=0,
     ):
         try:
             positive, negative = guider.raw_conds
@@ -687,31 +738,74 @@ class LTXVInContextSampler:
             )[0]
 
         if optional_cond_image is not None:
+            assert (optional_cond_image_strength is not None and bool(optional_cond_image_strength.strip())) or optional_cond_strength is not None, "You must specify optional_cond_image_strength or optional_cond_strength if optional_cond_image specified"
+
             optional_cond_image = (
                 comfy.utils.common_upscale(
                     optional_cond_image.movedim(-1, 1),
                     width * width_scale_factor,
                     height * height_scale_factor,
                     "bilinear",
-                    crop="disabled",
+                    crop=crop,
                 )
                 .movedim(1, -1)
                 .clamp(0, 1)
             )
-            (cond_image_latent,) = VAEEncode().encode(vae, optional_cond_image)
-            (
-                positive,
-                negative,
-                new_latents,
-            ) = LTXVAddLatentGuide().generate(
-                vae=vae,
-                positive=positive,
-                negative=negative,
-                latent=new_latents,
-                guiding_latent=cond_image_latent,
-                latent_idx=0,
-                strength=optional_cond_strength,
-            )
+            optional_cond_image = comfy_extras.nodes_lt.LTXVPreprocess().preprocess(
+                optional_cond_image, crf
+            )[0]
+            for i in range(optional_cond_image.shape[0]):
+                optional_cond_image[i] = blur_internal(
+                    optional_cond_image[i].unsqueeze(0), blur
+                )
+
+        if optional_cond_image_indices is None:
+            optional_cond_image_indices = "0"
+
+        if optional_cond_image is not None:
+            optional_cond_image_indices = optional_cond_image_indices.split(",")
+            optional_cond_image_indices = [int(i) for i in optional_cond_image_indices]
+            assert len(optional_cond_image_indices) == len(
+                optional_cond_image
+            ), "Number of optional cond images must match number of optional cond indices"
+
+        if optional_cond_image_strength is not None and bool(optional_cond_image_strength.strip()) and optional_cond_image is not None:
+            optional_cond_image_strength = optional_cond_image_strength.split(",")
+            optional_cond_image_strength = [float(i) for i in optional_cond_image_strength]
+            assert len(optional_cond_image_strength) == len(
+                optional_cond_image
+            ), "Number of optional cond images must match number of optional cond strength"
+            # New assertion to check if all strengths are between 0 and 1
+            assert all(0.0 <= s <= 1.0 for s in optional_cond_image_strength), "All optional cond image strengths must be floats between 0 and 1"
+        else:
+            optional_cond_strength = None
+
+        time_scale_factor, width_scale_factor, height_scale_factor = (
+            vae.downscale_index_formula
+        )
+
+        if optional_cond_image is not None:
+            cond_strengths_list = optional_cond_image_strength if optional_cond_image_strength is not None else [optional_cond_strength] * len(optional_cond_image)
+
+            for cond_image, cond_idx, cond_strength in zip(
+                optional_cond_image, optional_cond_image_indices, cond_strengths_list
+            ):
+                latent_idx = int(cond_idx // time_scale_factor)
+                #TODO maybe something else for image that isnt first
+                (cond_image_latent,) = VAEEncode().encode(vae, cond_image.unsqueeze(0))
+                (
+                    positive,
+                    negative,
+                    new_latents,
+                ) = LTXVAddLatentGuide().generate(
+                    vae=vae,
+                    positive=positive,
+                    negative=negative,
+                    latent=new_latents,
+                    guiding_latent=cond_image_latent,
+                    latent_idx=latent_idx,
+                    strength=optional_cond_strength,
+                )
 
         if optional_cond_image is not None:
             guiding_latents = LTXVSelectLatents().select_latents(
