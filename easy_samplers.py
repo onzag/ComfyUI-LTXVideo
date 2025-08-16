@@ -461,6 +461,8 @@ class LTXVExtendSampler:
         optional_cond_indices=None,
         optional_cond_strength=None,
         optional_cond_use_latent_guide=None,
+
+        guiding_latents_already_cropped=False,
     ):
         try:
             positive, negative = guider.raw_conds
@@ -613,9 +615,13 @@ class LTXVExtendSampler:
             # and then setting them to the end, instead it should go as it is, ensuring that
             # any first guided action happens even if end actions get cropped (which means you must increase num_frames)
             # if num_frames was specified
-            #optional_guiding_latents = LTXVSelectLatents().select_latents(
-            #    optional_guiding_latents, overlap, -1
-            #)[0]
+
+            # has to stay because it would otherwise not make work the looping sampler because they send the movement information
+            # as well regarding the overlapping frames and have to crop it
+            if not guiding_latents_already_cropped:
+                optional_guiding_latents = LTXVSelectLatents().select_latents(
+                    optional_guiding_latents, overlap, -1
+                )[0]
 
             #now the guiding latents start where it ended, even if the end is chopped off
             (
@@ -1304,16 +1310,23 @@ class LTXVHybridSampler:
             optional_cond_indices=optional_cond_indices,
             optional_cond_strength=optional_cond_strength,
             optional_cond_use_latent_guide=optional_cond_use_latent_guide,
+            guiding_latents_already_cropped=True,
         )
 
         # the extend sampler at the end removes 9 frames
         # tried to somehow calculate it from the tensor but this wasn't possible
         # or at least couldn't reliably figure out the 9 otherwise, but with the 8+1
         # LTXV rule, I assumed it was always 9
-        actual_num_frames = num_frames - 9;
+        # actual_num_frames = num_frames - 9;
+
+        # On the contrary it was because doing a cropped decode, the actual number of frames
+        # is plus seven as the 1 frame doesnt occur in a extension
+        actual_num_frames = num_frames + 7;
 
         generated_frames_idx = list(range(v_frames, v_frames + actual_num_frames))
         generated_frames_idx = ",".join(map(str, generated_frames_idx))
+
+        ## TODO fix this use negative indices where possible
 
         # so we want to figure what the difference was between the frames created and the number of frames
         diff_frames = actual_num_frames - num_frames
@@ -1410,4 +1423,3 @@ class LinearOverlapLatentTransition:
                 "batch_index": combined_batch_index,
             },
         )
-
